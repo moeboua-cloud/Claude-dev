@@ -52,13 +52,14 @@ class Entitlement(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(255), index=True)
-    entitlement_type: Mapped[str] = mapped_column(String(50))  # group_membership, app_role, license, permission
+    entitlement_type: Mapped[str] = mapped_column(String(50))  # group_membership, app_role, license, permission, file_share
     source_system: Mapped[str] = mapped_column(String(50))
     source_identifier: Mapped[str] = mapped_column(String(500))
     application_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("applications.id"), nullable=True)
     group_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("groups.id"), nullable=True)
     is_privileged: Mapped[bool] = mapped_column(Boolean, default=False)
     risk_level: Mapped[str] = mapped_column(String(20), default="low")
+    category: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)  # privileged_access, license, distribution_list, security_group, app_role, file_share
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 

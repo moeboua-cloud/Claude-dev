@@ -6,7 +6,28 @@ import { api } from "@/lib/api";
 import { LoadingSpinner } from "../../components/ui/LoadingSpinner";
 import { RiskChip } from "../../components/ui/RiskChip";
 import { StatusChip } from "../../components/ui/StatusChip";
-import type { UserDetail, AccessComparison, Recommendation } from "@/types/api";
+import type { UserDetail, AccessComparison, Recommendation, UserEntitlement } from "@/types/api";
+
+const CATEGORY_CONFIG: Record<string, { label: string; icon: string; color: string; bgColor: string }> = {
+  privileged_access: { label: "Privileged Access", icon: "🔑", color: "text-red-700", bgColor: "bg-red-50 border-red-200" },
+  license: { label: "Licenses", icon: "📄", color: "text-blue-700", bgColor: "bg-blue-50 border-blue-200" },
+  app_role: { label: "Application Roles", icon: "⚙️", color: "text-indigo-700", bgColor: "bg-indigo-50 border-indigo-200" },
+  security_group: { label: "Security Groups", icon: "🛡️", color: "text-green-700", bgColor: "bg-green-50 border-green-200" },
+  distribution_list: { label: "Distribution Lists", icon: "📧", color: "text-gray-700", bgColor: "bg-gray-50 border-gray-200" },
+  file_share: { label: "File Shares & SharePoint", icon: "📁", color: "text-amber-700", bgColor: "bg-amber-50 border-amber-200" },
+};
+
+const CATEGORY_ORDER = ["privileged_access", "license", "app_role", "security_group", "distribution_list", "file_share"];
+
+function groupByCategory(entitlements: UserEntitlement[]): Record<string, UserEntitlement[]> {
+  const grouped: Record<string, UserEntitlement[]> = {};
+  for (const ent of entitlements) {
+    const cat = ent.category || ent.entitlement_type || "other";
+    if (!grouped[cat]) grouped[cat] = [];
+    grouped[cat].push(ent);
+  }
+  return grouped;
+}
 
 export default function UserDetailPage() {
   const params = useParams();
@@ -51,6 +72,10 @@ export default function UserDetailPage() {
   if (loading) return <LoadingSpinner />;
   if (!user) return <div className="text-red-500">User not found</div>;
 
+  const categorized = groupByCategory(user.entitlements);
+  const privilegedCount = user.entitlements.filter((e) => e.is_privileged).length;
+  const exceptionCount = user.entitlements.filter((e) => e.is_exception).length;
+
   return (
     <div>
       {/* User header */}
@@ -81,31 +106,39 @@ export default function UserDetailPage() {
         </div>
       </div>
 
-      {/* Compliance summary */}
-      {comparison && (
-        <div className="grid grid-cols-5 gap-4 mb-6">
-          <div className="card p-4 text-center">
+      {/* Summary cards */}
+      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3 mb-6">
+        <div className="card p-3 text-center">
+          <p className="text-2xl font-bold">{user.entitlements.length}</p>
+          <p className="text-xs text-gray-500">Total</p>
+        </div>
+        {comparison && (
+          <div className="card p-3 text-center">
             <p className="text-2xl font-bold">{Math.round(comparison.overall_compliance_score * 100)}%</p>
             <p className="text-xs text-gray-500">Compliance</p>
           </div>
-          <div className="card p-4 text-center">
-            <p className="text-2xl font-bold text-green-600">{comparison.matched_entitlements.length}</p>
-            <p className="text-xs text-gray-500">Matched</p>
-          </div>
-          <div className="card p-4 text-center">
-            <p className="text-2xl font-bold text-red-600">{comparison.missing_entitlements.length}</p>
-            <p className="text-xs text-gray-500">Missing</p>
-          </div>
-          <div className="card p-4 text-center">
-            <p className="text-2xl font-bold text-orange-600">{comparison.excess_entitlements.length}</p>
-            <p className="text-xs text-gray-500">Excess</p>
-          </div>
-          <div className="card p-4 text-center">
-            <p className="text-2xl font-bold text-purple-600">{comparison.exception_entitlements.length}</p>
-            <p className="text-xs text-gray-500">Exceptions</p>
-          </div>
+        )}
+        <div className="card p-3 text-center border-l-4 border-l-red-400">
+          <p className="text-2xl font-bold text-red-600">{privilegedCount}</p>
+          <p className="text-xs text-gray-500">Privileged</p>
         </div>
-      )}
+        <div className="card p-3 text-center border-l-4 border-l-purple-400">
+          <p className="text-2xl font-bold text-purple-600">{exceptionCount}</p>
+          <p className="text-xs text-gray-500">Exceptions</p>
+        </div>
+        {comparison && (
+          <>
+            <div className="card p-3 text-center border-l-4 border-l-red-400">
+              <p className="text-2xl font-bold text-red-600">{comparison.missing_entitlements.length}</p>
+              <p className="text-xs text-gray-500">Missing</p>
+            </div>
+            <div className="card p-3 text-center border-l-4 border-l-orange-400">
+              <p className="text-2xl font-bold text-orange-600">{comparison.excess_entitlements.length}</p>
+              <p className="text-xs text-gray-500">Excess</p>
+            </div>
+          </>
+        )}
+      </div>
 
       {/* Tabs */}
       <div className="border-b mb-6">
@@ -126,34 +159,48 @@ export default function UserDetailPage() {
         </nav>
       </div>
 
-      {/* Tab content */}
+      {/* Access tab - grouped by category */}
       {activeTab === "access" && (
-        <div className="card overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="bg-gray-50 border-b">
-              <tr>
-                <th className="text-left px-4 py-3 font-medium text-gray-500">Entitlement</th>
-                <th className="text-left px-4 py-3 font-medium text-gray-500">Type</th>
-                <th className="text-left px-4 py-3 font-medium text-gray-500">Source</th>
-                <th className="text-left px-4 py-3 font-medium text-gray-500">Risk</th>
-                <th className="text-left px-4 py-3 font-medium text-gray-500">Flags</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {user.entitlements.map((ent) => (
-                <tr key={ent.id} className="hover:bg-gray-50">
-                  <td className="px-4 py-3 font-medium">{ent.entitlement_name}</td>
-                  <td className="px-4 py-3 text-gray-600">{ent.entitlement_type}</td>
-                  <td className="px-4 py-3 text-gray-600">{ent.source}</td>
-                  <td className="px-4 py-3"><RiskChip level={ent.risk_level} /></td>
-                  <td className="px-4 py-3">
-                    {ent.is_privileged && <span className="chip chip-critical mr-1">Privileged</span>}
-                    {ent.is_exception && <span className="chip bg-purple-100 text-purple-800">Exception</span>}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <div className="space-y-6">
+          {CATEGORY_ORDER.map((cat) => {
+            const ents = categorized[cat];
+            if (!ents || ents.length === 0) return null;
+            const config = CATEGORY_CONFIG[cat] || { label: cat, icon: "📋", color: "text-gray-700", bgColor: "bg-gray-50 border-gray-200" };
+            return (
+              <div key={cat} className={`card overflow-hidden border ${config.bgColor}`}>
+                <div className={`px-4 py-3 border-b ${config.bgColor}`}>
+                  <h3 className={`font-semibold ${config.color} flex items-center gap-2`}>
+                    <span>{config.icon}</span>
+                    {config.label}
+                    <span className="text-xs font-normal ml-1 opacity-70">({ents.length})</span>
+                  </h3>
+                </div>
+                <table className="w-full text-sm bg-white">
+                  <thead className="bg-gray-50 border-b">
+                    <tr>
+                      <th className="text-left px-4 py-2 font-medium text-gray-500">Entitlement</th>
+                      <th className="text-left px-4 py-2 font-medium text-gray-500">Source</th>
+                      <th className="text-left px-4 py-2 font-medium text-gray-500">Risk</th>
+                      <th className="text-left px-4 py-2 font-medium text-gray-500">Flags</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y">
+                    {ents.map((ent) => (
+                      <tr key={ent.id} className="hover:bg-gray-50">
+                        <td className="px-4 py-2 font-medium">{ent.entitlement_name}</td>
+                        <td className="px-4 py-2 text-gray-600">{ent.source}</td>
+                        <td className="px-4 py-2"><RiskChip level={ent.risk_level} /></td>
+                        <td className="px-4 py-2">
+                          {ent.is_privileged && <span className="chip chip-critical mr-1">Privileged</span>}
+                          {ent.is_exception && <span className="chip bg-purple-100 text-purple-800">Exception</span>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            );
+          })}
         </div>
       )}
 

@@ -45,6 +45,7 @@ class UserEntitlementResponse(BaseModel):
     id: UUID
     entitlement_name: str
     entitlement_type: str
+    category: Optional[str] = None
     source: str
     is_privileged: bool = False
     is_exception: bool = False

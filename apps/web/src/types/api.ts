@@ -25,6 +25,7 @@ export interface UserEntitlement {
   id: string;
   entitlement_name: string;
   entitlement_type: string;
+  category: string | null;
   source: string;
   is_privileged: boolean;
   is_exception: boolean;

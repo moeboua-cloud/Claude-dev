@@ -16,11 +16,11 @@ router = APIRouter(prefix="/users", tags=["users"])
 
 @router.get("", response_model=list[UserResponse])
 async def search_users(
-    query: str | None = Query(None),
-    department: str | None = Query(None),
-    job_family: str | None = Query(None),
-    lifecycle_state: str | None = Query(None),
-    limit: int = Query(50, le=200),
+    query: str | None = Query(None, max_length=200),
+    department: str | None = Query(None, max_length=100),
+    job_family: str | None = Query(None, max_length=100),
+    lifecycle_state: str | None = Query(None, max_length=50),
+    limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -51,6 +51,7 @@ async def get_user_detail(
             id=ue.id,
             entitlement_name=ent.name,
             entitlement_type=ent.entitlement_type,
+            category=ent.category,
             source=ue.source,
             is_privileged=ent.is_privileged,
             is_exception=ue.is_exception,

@@ -14,6 +14,46 @@ from app.connectors.registry import get_connector_registry
 from app.engine.policy_engine import DEFAULT_POLICIES
 from app.services.audit_service import AuditService
 
+# Map group name prefixes/types to entitlement categories
+CATEGORY_MAP = {
+    "privileged_access": "privileged_access",
+    "license": "license",
+    "distribution_list": "distribution_list",
+    "security_group": "security_group",
+    "app_role": "app_role",
+    "file_share": "file_share",
+}
+
+# Infer entitlement_type from category
+CATEGORY_TO_TYPE = {
+    "privileged_access": "group_membership",
+    "license": "license",
+    "distribution_list": "group_membership",
+    "security_group": "group_membership",
+    "app_role": "app_role",
+    "file_share": "file_share",
+}
+
+
+def _infer_category(group: dict[str, Any]) -> str:
+    """Infer the entitlement category from group data."""
+    if "category" in group:
+        return group["category"]
+    name = group.get("name", "")
+    if name.startswith("PAM-") or name.startswith("GRP-Domain") or group.get("is_privileged"):
+        return "privileged_access"
+    if group.get("type") == "license" or name.startswith("LIC-"):
+        return "license"
+    if group.get("type") == "distribution" or name.startswith("DL-"):
+        return "distribution_list"
+    if name.startswith("FS-") or name.startswith("SP-"):
+        return "file_share"
+    if name.startswith("APP-"):
+        return "app_role"
+    if group.get("type") == "role":
+        return "privileged_access"
+    return "security_group"
+
 
 class SyncService:
     def __init__(self, db: AsyncSession):
@@ -121,17 +161,21 @@ class SyncService:
 
     async def sync_groups(self) -> dict[str, int]:
         ad = self.registry.get_ad_connector()
-        ad_groups = await ad.fetch_groups()
+        entra = self.registry.get_entra_connector()
+
+        all_groups = await ad.fetch_groups()
+        entra_groups = await entra.fetch_groups()
+        all_groups.extend(entra_groups)
 
         created = 0
-        for g in ad_groups:
+        for g in all_groups:
             existing = await self.db.execute(select(Group).where(Group.name == g["name"]))
             if not existing.scalar_one_or_none():
                 self.db.add(Group(
                     name=g["name"],
                     display_name=g.get("display_name"),
                     group_type=g["type"],
-                    source=g["source"],
+                    source=g.get("source", "ad"),
                     is_privileged=g.get("is_privileged", False),
                     risk_level=g.get("risk_level", "low"),
                 ))
@@ -159,27 +203,35 @@ class SyncService:
         return {"created": created}
 
     async def sync_entitlements(self) -> dict[str, int]:
-        """Sync AD group memberships and app assignments as entitlements."""
+        """Sync AD group memberships, Entra groups/licenses, and app assignments as entitlements."""
         ad = self.registry.get_ad_connector()
+        entra = self.registry.get_entra_connector()
+
         ad_groups = await ad.fetch_groups()
+        entra_groups = await entra.fetch_groups()
+        all_groups = ad_groups + entra_groups
 
         # Ensure entitlement catalog entries for each group
         created_ents = 0
-        for g in ad_groups:
+        for g in all_groups:
             existing = await self.db.execute(
                 select(Entitlement).where(Entitlement.source_identifier == g["name"])
             )
             if not existing.scalar_one_or_none():
                 group_result = await self.db.execute(select(Group).where(Group.name == g["name"]))
                 group = group_result.scalar_one_or_none()
+                category = _infer_category(g)
+                ent_type = CATEGORY_TO_TYPE.get(category, "group_membership")
+
                 self.db.add(Entitlement(
                     name=g.get("display_name", g["name"]),
-                    entitlement_type="group_membership",
-                    source_system="ad",
+                    entitlement_type=ent_type,
+                    source_system=g.get("source", "ad"),
                     source_identifier=g["name"],
                     group_id=group.id if group else None,
                     is_privileged=g.get("is_privileged", False),
                     risk_level=g.get("risk_level", "low"),
+                    category=category,
                 ))
                 created_ents += 1
 
@@ -197,35 +249,53 @@ class SyncService:
                 continue
 
             for group_name in ad_user.get("groups", []):
-                ent_result = await self.db.execute(
-                    select(Entitlement).where(Entitlement.source_identifier == group_name)
-                )
-                ent = ent_result.scalar_one_or_none()
-                if not ent:
-                    continue
+                assigned += await self._assign_entitlement(user, group_name, "ad")
 
-                existing_ue = await self.db.execute(
-                    select(UserEntitlement).where(
-                        UserEntitlement.user_id == user.id,
-                        UserEntitlement.entitlement_id == ent.id,
-                    )
-                )
-                if not existing_ue.scalar_one_or_none():
-                    # Determine if this is an exception entitlement
-                    is_exception = self._is_known_exception(user.employee_id, group_name)
-                    self.db.add(UserEntitlement(
-                        user_id=user.id,
-                        entitlement_id=ent.id,
-                        source="ad",
-                        is_exception=is_exception,
-                        exception_reason="Approved exception per IAM-2024-001" if is_exception else None,
-                        exception_approved_by="iam_admin" if is_exception else None,
-                        granted_at=datetime.now(UTC),
-                    ))
-                    assigned += 1
+        # Sync user-entitlement mappings from Entra (licenses, roles, groups)
+        entra_users = await entra.fetch_users()
+        for entra_user in entra_users:
+            user_result = await self.db.execute(
+                select(User).where(User.employee_id == entra_user["employee_id"])
+            )
+            user = user_result.scalar_one_or_none()
+            if not user:
+                continue
+
+            for group_name in entra_user.get("entra_groups", []):
+                assigned += await self._assign_entitlement(user, group_name, "entra")
 
         await self.db.flush()
         return {"entitlements_created": created_ents, "assignments_created": assigned}
+
+    async def _assign_entitlement(self, user: User, source_identifier: str, source: str) -> int:
+        """Assign an entitlement to a user if not already assigned."""
+        ent_result = await self.db.execute(
+            select(Entitlement).where(Entitlement.source_identifier == source_identifier)
+        )
+        ent = ent_result.scalar_one_or_none()
+        if not ent:
+            return 0
+
+        existing_ue = await self.db.execute(
+            select(UserEntitlement).where(
+                UserEntitlement.user_id == user.id,
+                UserEntitlement.entitlement_id == ent.id,
+            )
+        )
+        if existing_ue.scalar_one_or_none():
+            return 0
+
+        is_exception = self._is_known_exception(user.employee_id, source_identifier)
+        self.db.add(UserEntitlement(
+            user_id=user.id,
+            entitlement_id=ent.id,
+            source=source,
+            is_exception=is_exception,
+            exception_reason="Approved exception per IAM-2024-001" if is_exception else None,
+            exception_approved_by="iam_admin" if is_exception else None,
+            granted_at=datetime.now(UTC),
+        ))
+        return 1
 
     def _is_known_exception(self, employee_id: str, group_name: str) -> bool:
         """Check if an entitlement is a known approved exception."""
@@ -245,8 +315,10 @@ class SyncService:
                     {"type": "group_membership", "id": "GRP-Finance-Users", "name": "Finance Department Users", "required": True},
                     {"type": "group_membership", "id": "DL-Finance-Team", "name": "Finance Team DL", "required": False},
                     {"type": "group_membership", "id": "DL-AllEmployees", "name": "All Employees", "required": True},
-                    {"type": "group_membership", "id": "APP-SAP-Users", "name": "SAP Standard Users", "required": True, "risk": "medium"},
-                    {"type": "group_membership", "id": "APP-ServiceNow-Users", "name": "ServiceNow Users", "required": True},
+                    {"type": "app_role", "id": "APP-SAP-Users", "name": "SAP Standard Users", "required": True, "risk": "medium"},
+                    {"type": "app_role", "id": "APP-ServiceNow-Users", "name": "ServiceNow Users", "required": True},
+                    {"type": "file_share", "id": "FS-Finance-ReadWrite", "name": "Finance File Share (Read/Write)", "required": True, "risk": "medium"},
+                    {"type": "license", "id": "LIC-M365-E3", "name": "Microsoft 365 E3 License", "required": True},
                 ],
                 "mapping": {"job_family": "Finance"},
             },
@@ -259,9 +331,11 @@ class SyncService:
                     {"type": "group_membership", "id": "GRP-IT-Users", "name": "IT Department Users", "required": True},
                     {"type": "group_membership", "id": "DL-IT-Team", "name": "IT Team DL", "required": False},
                     {"type": "group_membership", "id": "DL-AllEmployees", "name": "All Employees", "required": True},
-                    {"type": "group_membership", "id": "APP-Jira-Users", "name": "Jira Standard Users", "required": True},
-                    {"type": "group_membership", "id": "APP-ServiceNow-Users", "name": "ServiceNow Users", "required": True},
+                    {"type": "app_role", "id": "APP-Jira-Users", "name": "Jira Standard Users", "required": True},
+                    {"type": "app_role", "id": "APP-ServiceNow-Users", "name": "ServiceNow Users", "required": True},
                     {"type": "group_membership", "id": "PAM-ServerAdmins", "name": "Server Administrators (PAM)", "required": True, "privileged": True, "risk": "critical"},
+                    {"type": "license", "id": "LIC-M365-E5", "name": "Microsoft 365 E5 License", "required": True},
+                    {"type": "license", "id": "LIC-EMS-E5", "name": "Enterprise Mobility + Security E5", "required": True},
                 ],
                 "mapping": {"job_family": "Information Technology", "sub_job_family": "Infrastructure"},
             },
@@ -272,11 +346,13 @@ class SyncService:
                 "sub_job_family": "Software Engineering",
                 "entitlements": [
                     {"type": "group_membership", "id": "GRP-Engineering-Users", "name": "Engineering Department Users", "required": True},
-                    {"type": "group_membership", "id": "DL-IT-Team", "name": "IT Team DL", "required": False},
+                    {"type": "group_membership", "id": "DL-Engineering-Team", "name": "Engineering Team DL", "required": False},
                     {"type": "group_membership", "id": "DL-AllEmployees", "name": "All Employees", "required": True},
-                    {"type": "group_membership", "id": "APP-Jira-Users", "name": "Jira Standard Users", "required": True},
-                    {"type": "group_membership", "id": "APP-GitHub-Developers", "name": "GitHub Developer Access", "required": True, "risk": "medium"},
-                    {"type": "group_membership", "id": "APP-ServiceNow-Users", "name": "ServiceNow Users", "required": True},
+                    {"type": "app_role", "id": "APP-Jira-Users", "name": "Jira Standard Users", "required": True},
+                    {"type": "app_role", "id": "APP-GitHub-Developers", "name": "GitHub Developer Access", "required": True, "risk": "medium"},
+                    {"type": "app_role", "id": "APP-ServiceNow-Users", "name": "ServiceNow Users", "required": True},
+                    {"type": "file_share", "id": "FS-Engineering-Repos", "name": "Engineering Shared Repos", "required": True, "risk": "medium"},
+                    {"type": "license", "id": "LIC-M365-E3", "name": "Microsoft 365 E3 License", "required": True},
                 ],
                 "mapping": {"job_family": "Information Technology", "sub_job_family": "Software Engineering"},
             },
@@ -286,9 +362,12 @@ class SyncService:
                 "job_family": "Clinical",
                 "entitlements": [
                     {"type": "group_membership", "id": "GRP-Clinical-Users", "name": "Clinical Department Users", "required": True},
+                    {"type": "group_membership", "id": "DL-Clinical-Staff", "name": "Clinical Staff DL", "required": False},
                     {"type": "group_membership", "id": "DL-AllEmployees", "name": "All Employees", "required": True},
-                    {"type": "group_membership", "id": "APP-Epic-ClinicalUser", "name": "Epic Clinical User Access", "required": True, "risk": "medium"},
-                    {"type": "group_membership", "id": "APP-ServiceNow-Users", "name": "ServiceNow Users", "required": True},
+                    {"type": "app_role", "id": "APP-Epic-ClinicalUser", "name": "Epic Clinical User Access", "required": True, "risk": "medium"},
+                    {"type": "app_role", "id": "APP-ServiceNow-Users", "name": "ServiceNow Users", "required": True},
+                    {"type": "file_share", "id": "FS-Clinical-Records", "name": "Clinical Records (HIPAA)", "required": True, "privileged": True, "risk": "critical"},
+                    {"type": "license", "id": "LIC-M365-E3", "name": "Microsoft 365 E3 License", "required": True},
                 ],
                 "mapping": {"job_family": "Clinical"},
             },
@@ -298,8 +377,11 @@ class SyncService:
                 "job_family": "Human Resources",
                 "entitlements": [
                     {"type": "group_membership", "id": "GRP-HR-Users", "name": "HR Department Users", "required": True},
+                    {"type": "group_membership", "id": "DL-HR-Team", "name": "HR Team DL", "required": False},
                     {"type": "group_membership", "id": "DL-AllEmployees", "name": "All Employees", "required": True},
-                    {"type": "group_membership", "id": "APP-ServiceNow-Users", "name": "ServiceNow Users", "required": True},
+                    {"type": "app_role", "id": "APP-ServiceNow-Users", "name": "ServiceNow Users", "required": True},
+                    {"type": "file_share", "id": "FS-HR-Confidential", "name": "HR Confidential Files", "required": True, "privileged": True, "risk": "high"},
+                    {"type": "license", "id": "LIC-M365-E3", "name": "Microsoft 365 E3 License", "required": True},
                 ],
                 "mapping": {"job_family": "Human Resources"},
             },
@@ -310,10 +392,13 @@ class SyncService:
                 "sub_job_family": "Security Operations",
                 "entitlements": [
                     {"type": "group_membership", "id": "GRP-IT-Users", "name": "IT Department Users", "required": True},
+                    {"type": "group_membership", "id": "GRP-SecOps-Users", "name": "Security Operations Users", "required": True},
                     {"type": "group_membership", "id": "DL-IT-Team", "name": "IT Team DL", "required": False},
                     {"type": "group_membership", "id": "DL-AllEmployees", "name": "All Employees", "required": True},
-                    {"type": "group_membership", "id": "APP-Jira-Users", "name": "Jira Standard Users", "required": True},
-                    {"type": "group_membership", "id": "APP-ServiceNow-Users", "name": "ServiceNow Users", "required": True},
+                    {"type": "app_role", "id": "APP-Jira-Users", "name": "Jira Standard Users", "required": True},
+                    {"type": "app_role", "id": "APP-ServiceNow-Users", "name": "ServiceNow Users", "required": True},
+                    {"type": "license", "id": "LIC-M365-E5", "name": "Microsoft 365 E5 License", "required": True},
+                    {"type": "license", "id": "LIC-EMS-E5", "name": "Enterprise Mobility + Security E5", "required": True},
                 ],
                 "mapping": {"job_family": "Information Technology", "sub_job_family": "Security Operations"},
             },

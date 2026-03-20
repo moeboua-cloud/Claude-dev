@@ -1,5 +1,6 @@
 """Identity service - unified user profile and access graph retrieval."""
 
+import re
 import uuid
 from typing import Any
 
@@ -10,6 +11,14 @@ from sqlalchemy.orm import selectinload
 from app.models.identity import User, UserLifecycleEvent
 from app.models.entitlement import UserEntitlement, Entitlement
 from app.connectors.registry import get_connector_registry
+
+
+def _sanitize_search(value: str, max_length: int = 200) -> str:
+    """Sanitize search input to prevent abuse."""
+    value = value[:max_length].strip()
+    # Remove any null bytes
+    value = value.replace("\x00", "")
+    return value
 
 
 class IdentityService:
@@ -28,11 +37,13 @@ class IdentityService:
     ) -> tuple[list[User], int]:
         stmt = select(User)
         if query:
+            sanitized = _sanitize_search(query)
+            search_pattern = f"%{sanitized}%"
             stmt = stmt.where(
                 or_(
-                    User.display_name.ilike(f"%{query}%"),
-                    User.email.ilike(f"%{query}%"),
-                    User.employee_id.ilike(f"%{query}%"),
+                    User.display_name.ilike(search_pattern),
+                    User.email.ilike(search_pattern),
+                    User.employee_id.ilike(search_pattern),
                 )
             )
         if department:
@@ -76,12 +87,14 @@ class IdentityService:
             return {}
 
         entitlements_by_type: dict[str, list] = {}
+        entitlements_by_category: dict[str, list] = {}
         for ue in user.entitlements:
             ent = ue.entitlement
             entry = {
                 "id": str(ue.id),
                 "name": ent.name,
                 "type": ent.entitlement_type,
+                "category": ent.category or ent.entitlement_type,
                 "source": ue.source,
                 "is_privileged": ent.is_privileged,
                 "is_exception": ue.is_exception,
@@ -90,18 +103,18 @@ class IdentityService:
                 "last_used_at": ue.last_used_at.isoformat() if ue.last_used_at else None,
             }
             entitlements_by_type.setdefault(ent.entitlement_type, []).append(entry)
+            category = ent.category or ent.entitlement_type
+            entitlements_by_category.setdefault(category, []).append(entry)
 
+        all_entries = [e for ents in entitlements_by_type.values() for e in ents]
         return {
             "user_id": str(user.id),
             "employee_id": user.employee_id,
             "display_name": user.display_name,
             "lifecycle_state": user.lifecycle_state.value if user.lifecycle_state else "unknown",
             "entitlements_by_type": entitlements_by_type,
-            "total_entitlements": sum(len(v) for v in entitlements_by_type.values()),
-            "privileged_count": sum(
-                1 for ents in entitlements_by_type.values() for e in ents if e["is_privileged"]
-            ),
-            "exception_count": sum(
-                1 for ents in entitlements_by_type.values() for e in ents if e["is_exception"]
-            ),
+            "entitlements_by_category": entitlements_by_category,
+            "total_entitlements": len(all_entries),
+            "privileged_count": sum(1 for e in all_entries if e["is_privileged"]),
+            "exception_count": sum(1 for e in all_entries if e["is_exception"]),
         }

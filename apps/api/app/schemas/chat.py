@@ -4,12 +4,21 @@ from datetime import datetime
 from uuid import UUID
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(..., min_length=1, max_length=2000)
     context: Optional[dict] = None  # e.g., {"user_id": "..."} for contextual queries
+
+    @field_validator("message")
+    @classmethod
+    def sanitize_message(cls, v: str) -> str:
+        # Strip null bytes and excessive whitespace
+        v = v.replace("\x00", "").strip()
+        if not v:
+            raise ValueError("Message cannot be empty")
+        return v
 
 
 class EvidenceItem(BaseModel):
