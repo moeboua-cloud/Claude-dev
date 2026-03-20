@@ -24,7 +24,7 @@ class Application(Base):
     requires_license: Mapped[bool] = mapped_column(Boolean, default=False)
     sso_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     provisioning_method: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # scim, manual, ad_group
-    metadata: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    extra_metadata: Mapped[Optional[dict]] = mapped_column("metadata", JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 
@@ -41,7 +41,7 @@ class Group(Base):
     risk_level: Mapped[str] = mapped_column(String(20), default="low")
     owner_employee_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     application_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("applications.id"), nullable=True)
-    metadata: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    extra_metadata: Mapped[Optional[dict]] = mapped_column("metadata", JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
 
